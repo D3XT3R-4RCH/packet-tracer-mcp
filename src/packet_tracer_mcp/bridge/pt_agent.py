@@ -6,7 +6,7 @@ import logging
 from collections.abc import Callable, Coroutine
 from typing import Any
 from pydantic import ValidationError
-from packet_tracer_mcp.bridge.pt_api import PacketTracerAPI
+from packet_tracer_mcp.bridge.pt_api import NativePacketTracerAPI, PacketTracerAPI
 from packet_tracer_mcp.config import settings
 from packet_tracer_mcp.models.ipc import IPCRequestPayload, IPCResponsePayload, IPCStatus
 
@@ -26,8 +26,18 @@ class PacketTracerAgentServer:
     ) -> None:
         self.host: str = host if host is not None else settings.pt_host
         self.port: int = port if port is not None else settings.pt_port
-        self.api: PacketTracerAPI = api if api is not None else PacketTracerAPI()
+        if api is not None:
+            self.api: PacketTracerAPI = api
+        elif settings.pt_use_native_ipc:
+            self.api = NativePacketTracerAPI(
+                pt_ipc_host=self.host,
+                pt_ipc_port=settings.pt_native_port,
+                exapp_id=settings.pt_exapp_id,
+            )
+        else:
+            self.api = PacketTracerAPI()
         self._server: asyncio.AbstractServer | None = None
+        self._ready_event: asyncio.Event = asyncio.Event()
 
         self._dispatch_map: dict[str, ActionHandler] = {
             "get_topology": self.api.get_topology,
@@ -36,6 +46,18 @@ class PacketTracerAgentServer:
             "send_cli_command": self.api.send_cli_command,
             "execute_ping": self.api.execute_ping,
         }
+
+    @property
+    def bound_port(self) -> int:
+        """Devuelve el puerto TCP real asignado al servidor (útil cuando `port=0` efímero)."""
+        if self._server and self._server.sockets:
+            sockname = self._server.sockets[0].getsockname()
+            return int(sockname[1])
+        return self.port
+
+    async def wait_until_ready(self, timeout: float = 5.0) -> None:
+        """Espera hasta que el servidor TCP esté activo y aceptando conexiones."""
+        await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
 
     async def _process_raw_line(self, raw_line: bytes) -> IPCResponsePayload:
         """Decodifica una línea NDJSON, invoca el método en `PacketTracerAPI` y construye la respuesta."""
@@ -111,14 +133,20 @@ class PacketTracerAgentServer:
 
     async def start(self) -> None:
         """Inicia el servidor TCP asíncrono en `PT_HOST:PT_PORT` y mantiene el bucle activo."""
+        self._ready_event.clear()
         self._server = await asyncio.start_server(
             self.handle_client,
             host=self.host,
             port=self.port,
         )
+        self.port = self.bound_port
+        self._ready_event.set()
         logger.info("Agente IPC de Packet Tracer escuchando en %s:%s", self.host, self.port)
-        async with self._server:
-            await self._server.serve_forever()
+        try:
+            async with self._server:
+                await self._server.serve_forever()
+        except asyncio.CancelledError:
+            logger.info("Servidor Agente IPC cancelado limpiamente.")
 
     async def stop(self) -> None:
         """Detiene de forma limpia el servidor TCP asíncrono."""
@@ -126,6 +154,7 @@ class PacketTracerAgentServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+            self._ready_event.clear()
 
 
 def main() -> None:
