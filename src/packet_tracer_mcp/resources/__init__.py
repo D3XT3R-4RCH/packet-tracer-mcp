@@ -1,0 +1,2 @@
+"""Recursos y plantillas MCP."""
+
